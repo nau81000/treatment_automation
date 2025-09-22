@@ -1,0 +1,212 @@
+id: vins
+namespace: bottleneck 
+
+tasks:
+  - id: get_zipfile
+    description: Récupération du fichier ZIP depuis un dossier S3. Ajout d'un retry (10 tentatives toutes les 6 minutes)
+    type: io.kestra.plugin.core.http.Download
+    uri: https://s3.eu-west-1.amazonaws.com/course.oc-static.com/projects/922_Data+Engineer/922_P10/bottleneck.zip
+    retry:
+        type: constant
+        maxAttempt: 10
+        interval: PT6M
+  
+  - id: unzip
+    description: Dézippage du fichier zip
+    type: io.kestra.plugin.compress.ArchiveDecompress
+    algorithm: ZIP
+    from: "{{ outputs.get_zipfile.uri }}"
+
+  - id: parallel_clean
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: clean_erp
+        description: Suppression des doublons et des valeurs manquantes du fichier Erp
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: ghcr.io/kestra-io/pydata:latest
+        beforeCommands:
+          - pip install openpyxl
+        inputFiles: 
+          erp.excel: "{{ outputs.unzip.files['bottleneck/Fichier_erp.xlsx'] }}"
+        outputFiles:
+          - erp.csv
+        script: |-
+          import pandas as pd
+          import sys
+          # Lecture du fichier Excel
+          df = pd.read_excel('erp.excel')
+          # Suppression des valeurs manquantes
+          df.dropna(subset=['product_id'], inplace=True)
+          # Suppression des doublons
+          df.drop_duplicates(subset=['product_id'], inplace=True)
+          # Sauvegarde au format csv
+          df.to_csv('erp.csv', index=False)
+  
+      - id: clean_liaison
+        description: Suppression des doublons et des valeurs manquantes du fichier Liaison
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: ghcr.io/kestra-io/pydata:latest
+        beforeCommands:
+          - pip install openpyxl
+        inputFiles: 
+          liaison.excel: "{{ outputs.unzip.files['bottleneck/fichier_liaison.xlsx'] }}"
+        outputFiles:
+          - liaison.csv
+        script: |-
+          import pandas as pd
+          import sys
+          # Lecture du fichier Excel
+          df = pd.read_excel('liaison.excel')
+          # Suppression des valeurs manquantes
+          df.dropna(subset=['product_id'], inplace=True)
+          # Suppression des doublons
+          df.drop_duplicates(subset=['product_id'], inplace=True)
+          # Sauvegarde au format csv
+          df.to_csv('liaison.csv', index=False)
+
+      - id: clean_web
+        description: Suppression des doublons et des valeurs manquantes du fichier Web
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: ghcr.io/kestra-io/pydata:latest
+        beforeCommands:
+          - pip install openpyxl
+        inputFiles: 
+          web.excel: "{{ outputs.unzip.files['bottleneck/Fichier_web.xlsx'] }}"
+        outputFiles:
+          - web.csv
+        script: |-
+          import pandas as pd
+          import sys
+          # Lecture du fichier Excel
+          df = pd.read_excel('web.excel')
+          # Suppression des valeurs manquantes sur la clé primaire (sku)
+          df.dropna(subset=['sku'], inplace=True)
+          # Suppression des doublons en filtrant sur la colonne "tax_status"
+          #  et sauvegarde au format csv en ne gardant que les colonnes utiles
+          df.loc[df['tax_status'] == 'taxable',['sku', 'total_sales', 'post_title']].to_csv('web.csv', index=False)
+  
+  - id: join_all
+    description: Jointure des jeux de données
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    url: 'jdbc:duckdb:'
+    timeZoneId: Europe/Paris
+    inputFiles:
+      erp.csv: "{{ outputs.clean_erp.outputFiles['erp.csv']}}"
+      liaison.csv: "{{ outputs.clean_liaison.outputFiles['liaison.csv']}}"
+      web.csv: "{{ outputs.clean_web.outputFiles['web.csv']}}"
+    sql: |-
+      WITH 
+      erp AS (SELECT * FROM read_csv('erp.csv')),
+      liaison AS (SELECT * FROM read_csv('liaison.csv'))
+      SELECT erp.product_id, liaison.id_web, erp.price, web.total_sales, web.post_title FROM read_csv('web.csv') AS web
+      INNER JOIN liaison ON liaison.id_web = web.sku
+      INNER JOIN erp ON liaison.product_id = erp.product_id
+      ORDER BY erp.product_id;
+    store: true
+
+  - id: join_all_csv
+    description: Conversion de la jointure au format csv
+    type: io.kestra.plugin.serdes.csv.IonToCsv
+    from: "{{ outputs.join_all.uri }}"
+
+  - id: test_jointure
+    description: Test de la cohérence de la jointure
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: ghcr.io/kestra-io/pydata:latest
+    beforeCommands:
+      - pip install openpyxl
+    inputFiles: 
+      all.csv: "{{ outputs.join_all_csv.uri }}"
+      web.csv: "{{ outputs.clean_web.outputFiles['web.csv']}}"
+    script: |-
+      import pandas as pd
+      import sys
+      # Lecture du fichier csv
+      df_all = pd.read_csv('all.csv')
+      df_web = pd.read_csv('web.csv')
+      # Tests nb lignes
+      if df_all.shape[0] != df_web.shape[0]:
+        print("Incohérence dans la jointure des fichiers")
+        sys.exit(1)
+
+  - id: parallel_compute
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      - id: ca_par_produit
+        description: Calcul du chiffre d'affaires par produit et sauvegarde au format Ion
+        type: io.kestra.plugin.jdbc.duckdb.Query
+        url: 'jdbc:duckdb:'
+        timeZoneId: Europe/Paris
+        inputFiles:
+          all.csv: "{{ outputs.join_all_csv.uri }}"
+        sql: SELECT product_id, id_web, post_title, price, total_sales, ROUND(price*total_sales, 2) as ca FROM read_csv('all.csv');
+        store: true
+
+      - id: ca_total
+        description: Calcul du chiffre d'affaires total et sauvegarde au format Ion
+        type: io.kestra.plugin.jdbc.duckdb.Query
+        url: 'jdbc:duckdb:'
+        timeZoneId: Europe/Paris
+        inputFiles:
+          all.csv: "{{ outputs.join_all_csv.uri }}"
+        sql: SELECT SUM(ROUND(price*total_sales, 2)) as ca_total FROM read_csv('all.csv');
+        store: true
+
+      - id: filtre_millesimes_et_ordinaires
+        description: Extraction des vins millésimes et ordinaires avec la méthode Z_score
+        type: io.kestra.plugin.scripts.python.Script
+        containerImage: ghcr.io/kestra-io/pydata:latest
+        beforeCommands:
+          - pip install openpyxl
+        inputFiles: 
+          in.join_csv: "{{ outputs.join_all_csv.uri }}"
+        outputFiles:
+          - vins_millesimes.csv
+          - vins_ordinaires.csv
+        script: |-
+          import pandas as pd
+          columns_to_export = ['product_id', 'id_web', 'price', 'total_sales', 'post_title']
+          # Lecture du fichier csv
+          df = pd.read_csv('in.join_csv')
+          # Calcul du z-score pour chaque vin
+          df['price_z'] = (df['price'] - df['price'].mean()) / df['price'].std(ddof=0)
+          # Extraction des vins millésimes (z_score > 2)
+          df.loc[df['price_z'] > 2, columns_to_export].to_csv('vins_millesimes.csv', index=False)
+          # Extraction des vins millésimes (z_score <= 2)
+          df.loc[df['price_z'] <= 2, columns_to_export].to_csv('vins_ordinaires.csv', index=False)
+
+  - id: ca_par_produit_excel
+    description: Conversion du chiffre d'affaires par produit du format Ion au format Excel
+    type: io.kestra.plugin.serdes.excel.IonToExcel
+    from: "{{ outputs.ca_par_produit.uri }}"
+
+  - id: ca_total_excel
+    description: Conversion du chiffre d'affaires total du format Ion au format Excel
+    type: io.kestra.plugin.serdes.excel.IonToExcel
+    from: "{{ outputs.ca_total.uri }}"
+
+  - id: test_ca_total
+    description: Test de cohérence du chiffre d'affaires total
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: ghcr.io/kestra-io/pydata:latest
+    beforeCommands:
+      - pip install openpyxl
+    inputFiles: 
+      ca.xls: "{{ outputs.ca_total_excel.uri }}"
+    script: |-
+      import pandas as pd
+      import sys
+      # Lecture du fichier excel
+      df = pd.read_excel('ca.xls')
+      # Test cohérence du chiffre d'affaires total
+      ca_total = df['ca_total'].iloc[0]
+      if ca_total < 10000 and ca_total > 150000:
+        print("Incohérence du chiffre d'affaires total")
+        sys.exit(1)
+
+triggers:
+  - id: schedule
+    description: Exécution du flux tous les 15 du mois à 9h00
+    type: io.kestra.plugin.core.trigger.Schedule
+    timezone: Europe/Paris
+    cron: "0 9 15 * *"
