@@ -34,6 +34,7 @@ cp .env.template .env
 
 ```
 ├── docker-compose.yml             # Paramètrages des services
+├── results.pdf                    # Résultats d'analyse
 ├── config/                        # Modules utilisés par les services
 │   ├── prometheus/                     
 │       ├── prometheus.yml         # Configuration du service Prometheus
